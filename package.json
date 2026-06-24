@@ -1,0 +1,28 @@
+{
+  "name": "talkout",
+  "version": "0.0.1",
+  "private": true,
+  "description": "M0 — AI 对话说服游戏脚手架",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "preflight": "node scripts/preflight.mjs",
+    "eval": "node scripts/eval.mjs"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.3",
+    "html-to-image": "^1.11.13",
+    "next": "^15.1.0",
+    "openai": "^4.77.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}
