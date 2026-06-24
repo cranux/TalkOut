@@ -46,7 +46,8 @@ const TOOL_NAME = "guard_response";
 type Msg = { role: "user" | "assistant"; content: string };
 
 // 兜底输出说明:当模型不调用工具时(思考模型常见),让它直接吐等价 JSON。
-const JSON_INSTRUCTION = `输出要求:优先调用工具 ${TOOL_NAME} 返回结果;若无法调用工具,则只输出一个等价的 JSON 对象,不要任何额外文字或代码围栏,字段为:
+// 强调“每一轮”——防止多轮对话里模型漂回纯聊天、忘了套 JSON。
+const JSON_INSTRUCTION = `输出格式(每一轮都必须遵守,不管第几轮):优先调用工具 ${TOOL_NAME};若不调用工具,则本次回复**只能是一个 JSON 对象**,不许有任何前后缀、解释或代码围栏。角色台词写进 reply 字段,不要直接当聊天发出来。字段:
 {"reply": "角色台词", "emotion": "wary|amused|annoyed|won_over", "persuasion_delta": -20到20的整数, "redline_hit": true或false}`;
 
 // guard_response 工具定义(支持 function calling 的模型走这条路,结构最稳)
@@ -61,15 +62,24 @@ const TOOLS = [
   },
 ];
 
-// 进程级记忆:auto 模式下一旦发现模型不支持工具,后续直接走纯 JSON,不再每次试错
-let runtimeToolsDisabled = false;
+// 进程级记忆:发现一次就记住,后续不再重复试错
+let runtimeToolsDisabled = false; // 模型不支持工具调用
+let runtimeJsonFormatUnsupported = false; // 端点不支持 response_format
+
+/** 从模型回复里拿不到可用结构(没工具调用、正文也没 JSON)→ 触发降级,而非直接 500 */
+class NoJsonError extends Error {
+  constructor(msg = "模型输出里找不到 JSON") {
+    super(msg);
+    this.name = "NoJsonError";
+  }
+}
 
 /**
- * 统一入口:给 system + 对话,返回结构化的一轮结果。
- * 三种模式(环境变量 LLM_TOOL_MODE 控制):
- *   auto(默认)— 先试工具调用,遇到"不支持工具/tool_choice"的 400 自动降级为纯 JSON
- *   tool       — 始终发工具(明确知道模型支持时用)
- *   json       — 从不发 tools,只靠提示词 + 容错解析(兼容纯推理模型)
+ * 统一入口:给 system + 对话,返回结构化的一轮结果。逐级降级,任何 OpenAI 兼容端点都能跑:
+ *   1) 工具调用(tool_choice=auto)        ——结构最稳
+ *   2) response_format=json_object        ——解码层强制只吐 JSON,**多轮不会漂**
+ *   3) 纯提示词 + 容错解析                ——连 response_format 都不收的端点兜底
+ * 环境变量 LLM_TOOL_MODE:auto(默认,1→2→3) | tool(只走 1,失败即抛) | json(2→3,从不发工具)
  */
 export async function generateGuardTurn(
   system: string,
@@ -86,42 +96,74 @@ export async function generateGuardTurn(
 
   const client = new OpenAI({ apiKey: cfg.apiKey, baseURL: cfg.baseURL });
   const sys = `${system}\n\n${JSON_INSTRUCTION}`;
-
   const mode = (process.env.LLM_TOOL_MODE || "auto").toLowerCase();
-  const tryTools = mode !== "json" && !runtimeToolsDisabled;
 
-  if (tryTools) {
+  // 模式 tool:只走工具,失败如实抛(诊断用)
+  if (mode === "tool") {
+    return parseTurn(await complete(client, cfg, sys, messages, { useTools: true }));
+  }
+
+  // 模式 auto:① 先试工具
+  if (mode === "auto" && !runtimeToolsDisabled) {
     try {
-      return parseTurn(await complete(client, cfg, sys, messages, true));
+      return parseTurn(await complete(client, cfg, sys, messages, { useTools: true }));
     } catch (err) {
-      // 只有 auto 模式才自动降级;tool 模式让错误抛出,方便排查
-      if (mode === "auto" && isToolUnsupported(err)) {
+      if (isToolUnsupported(err)) {
         runtimeToolsDisabled = true;
-        console.warn("[llm] 当前模型不支持工具调用,自动降级为纯 JSON 模式");
-      } else {
-        throw err;
+        console.warn("[llm] 模型不支持工具调用 → 降级 JSON 模式");
+      } else if (!(err instanceof NoJsonError)) {
+        throw err; // 网络/鉴权/限流等真错误,如实抛出
       }
+      // NoJsonError(没调工具、正文也没 JSON)或工具不支持 → 落到 ② JSON 模式
     }
   }
 
-  // 纯 JSON 模式:不发 tools / tool_choice,任何 OpenAI 兼容端点都能跑
-  return parseTurn(await complete(client, cfg, sys, messages, false));
+  // ② response_format=json_object → ③ 纯提示词
+  return jsonCompletion(client, cfg, sys, messages);
 }
 
-/** 发一次请求;useTools=false 时完全不带 tools 字段(纯推理模型也不会报 400) */
+/** JSON 模式:先用 response_format 强约束;端点不支持就退回纯提示词 */
+async function jsonCompletion(
+  client: OpenAI,
+  cfg: ResolvedConfig,
+  sys: string,
+  messages: Msg[]
+): Promise<GuardTurn> {
+  if (!runtimeJsonFormatUnsupported) {
+    try {
+      return parseTurn(
+        await complete(client, cfg, sys, messages, { jsonMode: true })
+      );
+    } catch (err) {
+      if (isResponseFormatUnsupported(err)) {
+        runtimeJsonFormatUnsupported = true;
+        console.warn("[llm] 端点不支持 response_format → 退回纯提示词");
+      } else {
+        throw err; // 含 NoJsonError:json_object 都没 JSON,属异常
+      }
+    }
+  }
+  // ③ 最后兜底:纯提示词 + 容错解析
+  return parseTurn(await complete(client, cfg, sys, messages, {}));
+}
+
+/** 发一次请求。useTools→带工具定义;jsonMode→带 response_format。都不带 = 纯文本。 */
 async function complete(
   client: OpenAI,
   cfg: ResolvedConfig,
   sys: string,
   messages: Msg[],
-  useTools: boolean
+  opts: { useTools?: boolean; jsonMode?: boolean } = {}
 ) {
   const res = await client.chat.completions.create({
     model: cfg.model,
-    // 思考模型的推理 token 也算在内,400 容易只剩推理、答案为空 → 默认调高,可用 LLM_MAX_TOKENS 覆盖
+    // 思考模型的推理 token 也算在内,太小容易只剩推理 → 默认 1024,可用 LLM_MAX_TOKENS 调高
     max_tokens: Number(process.env.LLM_MAX_TOKENS) || 1024,
     messages: [{ role: "system", content: sys }, ...messages],
-    ...(useTools ? { tools: TOOLS, tool_choice: "auto" as const } : {}),
+    ...(opts.useTools ? { tools: TOOLS, tool_choice: "auto" as const } : {}),
+    ...(opts.jsonMode
+      ? { response_format: { type: "json_object" as const } }
+      : {}),
   });
   return res.choices[0]?.message;
 }
@@ -137,7 +179,8 @@ function parseTurn(
   if (msg?.content) {
     return normalizeGuardTurn(extractJson(msg.content));
   }
-  throw new Error("模型没有返回可用的工具调用或文本内容");
+  // 没工具调用、也没正文 → 当作"拿不到结构化输出",交给上层降级
+  throw new NoJsonError("模型没有返回可用的工具调用或文本内容");
 }
 
 /** 判断错误是否为"模型/服务商不支持工具或强制 tool_choice"的 400 */
@@ -150,6 +193,18 @@ function isToolUnsupported(err: unknown): boolean {
   if (e?.status !== 400) return false;
   const m = `${e?.message ?? ""} ${e?.error?.message ?? ""}`.toLowerCase();
   return /tool|function|tool_choice|thinking|不支持/.test(m);
+}
+
+/** 判断错误是否为"端点不支持 response_format / json_object"的 400 */
+function isResponseFormatUnsupported(err: unknown): boolean {
+  const e = err as {
+    status?: number;
+    message?: string;
+    error?: { message?: string };
+  };
+  if (e?.status !== 400) return false;
+  const m = `${e?.message ?? ""} ${e?.error?.message ?? ""}`.toLowerCase();
+  return /response_format|response format|json_object|json mode|不支持/.test(m);
 }
 
 function safeParse(s: string): unknown {
@@ -168,9 +223,14 @@ function extractJson(text: string): unknown {
   const start = s.indexOf("{");
   const end = s.lastIndexOf("}");
   if (start === -1 || end <= start) {
-    throw new Error("模型输出里找不到 JSON");
+    throw new NoJsonError();
   }
-  return JSON.parse(s.slice(start, end + 1));
+  try {
+    return JSON.parse(s.slice(start, end + 1));
+  } catch {
+    // 截断/畸形 JSON 也当作"拿不到结构化输出",交给上层降级(而非裸 SyntaxError → 500)
+    throw new NoJsonError("JSON 解析失败(可能被 max_tokens 截断)");
+  }
 }
 
 /** 把可能脏的对象规整成合法的 GuardTurn(防止字符串数字、缺字段等) */
