@@ -1,0 +1,69 @@
+TalkOut 嘴遁 — Non-Commercial License (源码公开 · 非商用)
+版权所有 © 2026 cranux（原创始人 / Original Founder）
+
+项目来源 / Project: https://github.com/cranux/TalkOut
+
+注:请把上方的 “cranux” 替换为你希望署名的真实姓名 / 昵称（原创始人）。
+
+================================================================
+中文条款（与英文条款冲突时，以中文为准）
+================================================================
+
+1. 授权范围
+   在满足下列「署名」与「非商业」条件、并完整保留本许可证全文的前提下，
+   任何人可以免费使用、复制、修改、合并、发布、分发本软件及其衍生作品。
+
+2. 署名（必须）
+   任何使用、分发或基于本软件的衍生作品，都必须在显著位置保留：
+   - 原创始人 cranux 的署名；
+   - 本项目来源链接 https://github.com/cranux/TalkOut ；
+   - 本许可证全文（LICENSE 文件）。
+
+3. 非商业限制（必须）
+   未经原创始人事先书面许可，禁止将本软件或其衍生作品直接或间接用于任何
+   商业用途，包括但不限于：销售、收费部署、付费会员/订阅、广告变现、
+   商业 SaaS、为营利组织提供服务等。
+   如需商业授权，请通过项目仓库联系原创始人单独授权。
+
+4. 衍生作品
+   修改或二次开发后再分发的，必须同样适用本许可证（非商业 + 署名），
+   且需注明你所做的修改。
+
+5. 免责声明
+   本软件按「原样（AS IS）」提供，不附带任何明示或暗示的担保，包括但不限于
+   适销性、特定用途适用性与不侵权。任何情况下，作者或版权持有人均不对任何
+   索赔、损害或其他责任负责，无论是合同、侵权或其他原因引起。
+
+================================================================
+English Terms (in case of conflict, the Chinese text prevails)
+================================================================
+
+Copyright © 2026 cranux (Original Founder).
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated files (the "Software"), to use, copy, modify, merge,
+publish, and distribute the Software and derivative works, SUBJECT TO the
+following conditions:
+
+1. Attribution. All copies, distributions, and derivative works must visibly
+   retain credit to the Original Founder "cranux", a link to the project
+   (https://github.com/cranux/TalkOut), and the full text of this License.
+
+2. Non-Commercial. Commercial use of the Software or any derivative work is
+   PROHIBITED without the prior written permission of the Original Founder.
+   "Commercial use" includes, without limitation, selling, paid hosting, paid
+   subscriptions/memberships, ad monetization, commercial SaaS, or providing
+   services to a for-profit entity. For a commercial license, contact the
+   Original Founder via the project repository.
+
+3. ShareAlike. Derivative works that are distributed must be licensed under
+   these same terms (Non-Commercial + Attribution) and must state the changes
+   made.
+
+4. Disclaimer. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+   EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
+   OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.

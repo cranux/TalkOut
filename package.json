@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "description": "M0 — AI 对话说服游戏脚手架",
+  "license": "SEE LICENSE IN LICENSE",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
