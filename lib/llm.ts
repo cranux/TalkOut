@@ -94,7 +94,16 @@ export async function generateGuardTurn(
     baseURL: raw.baseURL,
   };
 
-  const client = new OpenAI({ apiKey: cfg.apiKey, baseURL: cfg.baseURL });
+  // 超时设得比 Vercel 函数上限(vercel.json maxDuration=60s)略小:慢端点会被
+  // 优雅中断 → 走到 catch 返回 500 → 前端显示“网络抽风”且不计回合,而不是被
+  // 平台硬超时成 504。maxRetries 默认 0:慢思考模型的请求不要静默重试叠加延迟
+  // (OpenAI SDK 默认重试 2 次,一次 429/5xx 就可能把耗时翻几倍直接撞上限)。
+  const client = new OpenAI({
+    apiKey: cfg.apiKey,
+    baseURL: cfg.baseURL,
+    timeout: Number(process.env.LLM_TIMEOUT_MS) || 50_000,
+    maxRetries: Number(process.env.LLM_MAX_RETRIES) || 0, // 非法/未设 → 0,不静默重试
+  });
   const sys = `${system}\n\n${JSON_INSTRUCTION}`;
   const mode = (process.env.LLM_TOOL_MODE || "auto").toLowerCase();
 
@@ -155,7 +164,7 @@ async function complete(
   messages: Msg[],
   opts: { useTools?: boolean; jsonMode?: boolean } = {}
 ) {
-  const res = await client.chat.completions.create({
+  const body = {
     model: cfg.model,
     // 思考模型的推理 token 也算在内,太小容易只剩推理 → 默认 1024,可用 LLM_MAX_TOKENS 调高
     max_tokens: Number(process.env.LLM_MAX_TOKENS) || 1024,
@@ -164,7 +173,9 @@ async function complete(
     ...(opts.jsonMode
       ? { response_format: { type: "json_object" as const } }
       : {}),
-  });
+    ...extraBody(), // 透传额外参数(如关思考),放最后以便按需覆盖
+  } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
+  const res = await client.chat.completions.create(body);
   return res.choices[0]?.message;
 }
 
@@ -205,6 +216,26 @@ function isResponseFormatUnsupported(err: unknown): boolean {
   if (e?.status !== 400) return false;
   const m = `${e?.message ?? ""} ${e?.error?.message ?? ""}`.toLowerCase();
   return /response_format|response format|json_object|json mode|不支持/.test(m);
+}
+
+/**
+ * 透传给模型接口的额外 body 参数(JSON,来自 LLM_EXTRA_BODY)。
+ * 最大用途:关掉思考模型的推理,大幅降延迟,以便单轮在 Vercel Hobby 的 60s 内跑完。
+ * 不同网关参数名不同,常见几种(任选其一):
+ *   GLM/智谱:  {"thinking":{"type":"disabled"}}
+ *   vLLM/中转:  {"chat_template_kwargs":{"enable_thinking":false}}
+ *   通用推理档: {"reasoning_effort":"low"}
+ */
+function extraBody(): Record<string, unknown> {
+  const raw = process.env.LLM_EXTRA_BODY;
+  if (!raw) return {};
+  try {
+    const o = JSON.parse(raw);
+    return o && typeof o === "object" ? (o as Record<string, unknown>) : {};
+  } catch {
+    console.warn("[llm] LLM_EXTRA_BODY 不是合法 JSON,已忽略");
+    return {};
+  }
 }
 
 function safeParse(s: string): unknown {
