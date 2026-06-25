@@ -42,6 +42,7 @@ export default function Game({
   const [best, setBest] = useState<{ content: string; delta: number } | null>(
     null
   );
+  const [netError, setNetError] = useState(false);
   const chatRef = useRef<HTMLDivElement>(null);
 
   const rounds = lines.filter((l) => l.role === "user").length;
@@ -62,10 +63,12 @@ export default function Game({
     const text = input.trim();
     if (!text || loading || outcome !== "ongoing") return;
 
+    const prevLines = lines;
     const nextLines: Line[] = [...lines, { role: "user", content: text }];
     setLines(nextLines);
     setInput("");
     setLoading(true);
+    setNetError(false);
 
     try {
       const res = await fetch("/api/talk", {
@@ -110,10 +113,11 @@ export default function Game({
         });
       }
     } catch {
-      setLines([
-        ...nextLines,
-        { role: "assistant", content: "（网络抽风了，再说一遍？）" },
-      ]);
+      // 网络抽风/请求失败:这一回合作废,回滚到发送前 —— 不计入回合数,
+      // 把刚才那句还给输入框,让用户原样重发。
+      setLines(prevLines);
+      setInput(text);
+      setNetError(true);
     } finally {
       setLoading(false);
     }
@@ -189,6 +193,12 @@ export default function Game({
         ))}
 
         {loading && <div className="typing">{character.name} 正在想…</div>}
+
+        {netError && !loading && (
+          <div className="net-error" role="alert">
+            ⚠️ 网络抽风,这句没发出去 —— 不算回合,再点发送试一次。
+          </div>
+        )}
 
         {outcome === "won" && (
           <div className="outcome won">🎉 你说服了 {character.name}！</div>

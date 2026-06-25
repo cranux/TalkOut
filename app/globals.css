@@ -302,6 +302,21 @@ body {
   padding: 4px 2px;
 }
 
+.net-error {
+  align-self: stretch;
+  width: 100%;
+  text-align: center;
+  padding: 10px 14px;
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  margin: 2px 0;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  background: var(--accent);
+  box-shadow: 3px 3px 0 var(--shd);
+}
+
 /* ===== 角色选择页 ===== */
 .select {
   flex: 1;
