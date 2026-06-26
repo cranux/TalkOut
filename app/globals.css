@@ -201,6 +201,15 @@ body {
 .delta.down {
   color: var(--bad);
 }
+.delta.zero {
+  color: var(--muted);
+  opacity: 0.75;
+}
+.delta.missing {
+  color: var(--muted);
+  opacity: 0.55;
+  font-style: italic;
+}
 
 .outcome {
   align-self: stretch;

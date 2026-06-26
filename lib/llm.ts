@@ -1,230 +1,201 @@
 import OpenAI from "openai";
 import type { Emotion, GuardTurn } from "./types";
 
-// ── 模型配置层(统一 OpenAI 协议)──────────────────────────
-// 任何 OpenAI 兼容端点都行,三件套即可:
-//   LLM_API_KEY  = 服务商的 key                          (必填)
-//   LLM_MODEL    = 模型名,如 gpt-4o-mini / deepseek-chat (必填)
-//   LLM_BASE_URL = 接口地址,如 https://api.deepseek.com/v1(选填;留空 = OpenAI 官方端点)
-// 另有可选:LLM_MAX_TOKENS(默认 1024)、LLM_TOOL_MODE(auto|tool|json,默认 auto)
+// ── 配置 ─────────────────────────────────────────────────────────
+// 任何 OpenAI 兼容端点都能跑,三件套必填:
+//   LLM_API_KEY   服务商 key
+//   LLM_MODEL     模型名(deepseek-chat / gpt-4o-mini / glm-4-flash / ...)
+//   LLM_BASE_URL  端点地址,留空 = OpenAI 官方
+// 可选:
+//   LLM_TOOL_MODE   auto(默认,tool→json→prompt)| tool | json
+//   LLM_MAX_TOKENS  默认 1024;思考模型建议调高
+//   LLM_TIMEOUT_MS  默认 50000;略小于 vercel maxDuration 才能优雅返 500
+//   LLM_MAX_RETRIES 默认 0;慢思考模型重试会叠加延迟撞函数上限
+//   LLM_EXTRA_BODY  JSON 字符串,透传给接口的额外字段(最常用:关思考)
 
 type ResolvedConfig = { apiKey: string; model: string; baseURL?: string };
+type Msg = { role: "user" | "assistant"; content: string };
+type Mode = "tool" | "json" | "prompt";
 
-export function llmConfig(): {
-  apiKey?: string;
-  model?: string;
-  baseURL?: string;
-} {
+export function llmConfig() {
   return {
     apiKey: process.env.LLM_API_KEY,
     model: process.env.LLM_MODEL,
-    baseURL: process.env.LLM_BASE_URL, // 留空则走 OpenAI SDK 默认端点
+    baseURL: process.env.LLM_BASE_URL,
   };
 }
 
-// 结构化输出的参数 schema(function calling)
-const PARAMS = {
+// ── 结构化输出 schema ────────────────────────────────────────────
+
+const TOOL_NAME = "guard_response";
+const EMOTIONS: Emotion[] = ["wary", "amused", "annoyed", "won_over"];
+
+const SCHEMA = {
   type: "object",
   properties: {
     reply: { type: "string", description: "角色这一轮的台词(口语、简短、贴合人设)。" },
-    emotion: {
-      type: "string",
-      enum: ["wary", "amused", "annoyed", "won_over"],
-      description: "角色当前情绪。",
-    },
-    persuasion_delta: {
-      type: "integer",
-      description: "本轮说服度变化,-20 到 +20。",
-    },
+    emotion: { type: "string", enum: EMOTIONS, description: "角色当前情绪。" },
+    persuasion_delta: { type: "integer", description: "本轮说服度变化,-20 到 +20。" },
     redline_hit: { type: "boolean", description: "玩家是否踩了红线。" },
   },
   required: ["reply", "emotion", "persuasion_delta", "redline_hit"],
 } as const;
 
-const TOOL_NAME = "guard_response";
-
-type Msg = { role: "user" | "assistant"; content: string };
-
-// 兜底输出说明:当模型不调用工具时(思考模型常见),让它直接吐等价 JSON。
-// 强调“每一轮”——防止多轮对话里模型漂回纯聊天、忘了套 JSON。
-const JSON_INSTRUCTION = `输出格式(每一轮都必须遵守,不管第几轮):优先调用工具 ${TOOL_NAME};若不调用工具,则本次回复**只能是一个 JSON 对象**,不许有任何前后缀、解释或代码围栏。角色台词写进 reply 字段,不要直接当聊天发出来。字段:
-{"reply": "角色台词", "emotion": "wary|amused|annoyed|won_over", "persuasion_delta": -20到20的整数, "redline_hit": true或false}`;
-
-// guard_response 工具定义(支持 function calling 的模型走这条路,结构最稳)
 const TOOLS = [
   {
     type: "function" as const,
     function: {
       name: TOOL_NAME,
       description: "以角色身份回应玩家,并给出本轮说服度判定。每一轮都必须调用。",
-      parameters: PARAMS,
+      parameters: SCHEMA,
     },
   },
 ];
 
-// 进程级记忆:发现一次就记住,后续不再重复试错
-let runtimeToolsDisabled = false; // 模型不支持工具调用
-let runtimeJsonFormatUnsupported = false; // 端点不支持 response_format
+// 多轮里防止模型漂回纯聊天的兜底说明(json/prompt 模式需要它当 schema 文档)。
+// 显式要求 4 字段全填:很多小模型会偷懒省"无意义"字段(0、false 之类),
+// 漏字段在前端会渲染成"说服度 ？",玩家体验会以为是 bug。
+const JSON_INSTRUCTION = `输出格式(每一轮都必须遵守):优先调用工具 ${TOOL_NAME};若不调用工具,则本次回复**只能是一个 JSON 对象**,不许有任何前后缀、解释或代码围栏。角色台词写进 reply 字段,不要直接当聊天发出来。
 
-/** 从模型回复里拿不到可用结构(没工具调用、正文也没 JSON)→ 触发降级,而非直接 500 */
+**四个字段全部必填,一个都不许省略**,即便 persuasion_delta 这一轮判 0、redline_hit 是 false,也必须显式写出来。字段:
+{"reply": "角色台词", "emotion": "wary|amused|annoyed|won_over", "persuasion_delta": -20到20的整数, "redline_hit": true或false}`;
+
+// ── 错误模型 ─────────────────────────────────────────────────────
+
+/** 拿不到可解析结构(没调工具、正文也没 JSON)→ 触发降级,不当真错 */
 class NoJsonError extends Error {
+  override name = "NoJsonError";
   constructor(msg = "模型输出里找不到 JSON") {
     super(msg);
-    this.name = "NoJsonError";
   }
 }
+
+// 进程级 sticky:端点 400 拒收某能力 → 记住,后续别再撞同一面墙。
+// 注意:NoJsonError 不锁——那是模型多轮漂移,端点本身可能完全支持。
+const blocked: Partial<Record<Mode, boolean>> = {};
+
+const TOOL_REJECT = /tool|function|tool_choice|thinking|不支持/;
+const JSON_REJECT = /response_format|response format|json_object|json mode|不支持/;
+
+function endpointRejected(err: unknown, pattern: RegExp): boolean {
+  const e = err as { status?: number; message?: string; error?: { message?: string } };
+  if (e?.status !== 400) return false;
+  const m = `${e?.message ?? ""} ${e?.error?.message ?? ""}`.toLowerCase();
+  return pattern.test(m);
+}
+
+type Decision = "throw" | "retry" | "stick";
+
+/** 错误归类:本模式失败后该怎么处理 */
+function classify(err: unknown, mode: Mode): Decision {
+  if (err instanceof NoJsonError) return "retry";
+  if (mode === "tool" && endpointRejected(err, TOOL_REJECT)) return "stick";
+  if (mode === "json" && endpointRejected(err, JSON_REJECT)) return "stick";
+  return "throw"; // 网络 / 鉴权 / 限流 / 未识别 400 → 都是真错,不假装没事
+}
+
+// ── 主流程 ───────────────────────────────────────────────────────
 
 /**
- * 统一入口:给 system + 对话,返回结构化的一轮结果。逐级降级,任何 OpenAI 兼容端点都能跑:
- *   1) 工具调用(tool_choice=auto)        ——结构最稳
- *   2) response_format=json_object        ——解码层强制只吐 JSON,**多轮不会漂**
- *   3) 纯提示词 + 容错解析                ——连 response_format 都不收的端点兜底
- * 环境变量 LLM_TOOL_MODE:auto(默认,1→2→3) | tool(只走 1,失败即抛) | json(2→3,从不发工具)
+ * 给 system + 对话,返回结构化的一轮结果。
+ * 降级链(任何 OpenAI 兼容端点都能跑):
+ *   tool   工具调用,结构最稳(模型支持 function calling 才行)
+ *   json   response_format=json_object,解码层强制 JSON
+ *   prompt 纯提示词 + 容错解析,什么都不需要
+ * LLM_TOOL_MODE:auto(默认)/ tool(只走工具,失败即抛)/ json(json→prompt)
  */
-export async function generateGuardTurn(
-  system: string,
-  messages: Msg[]
-): Promise<GuardTurn> {
-  const raw = llmConfig();
-  if (!raw.apiKey) throw new Error("缺少 LLM_API_KEY");
-  if (!raw.model) throw new Error("缺少 LLM_MODEL(请指定模型名)");
-  const cfg: ResolvedConfig = {
-    apiKey: raw.apiKey,
-    model: raw.model,
-    baseURL: raw.baseURL,
-  };
-
-  // 超时设得比 Vercel 函数上限(vercel.json maxDuration=60s)略小:慢端点会被
-  // 优雅中断 → 走到 catch 返回 500 → 前端显示“网络抽风”且不计回合,而不是被
-  // 平台硬超时成 504。maxRetries 默认 0:慢思考模型的请求不要静默重试叠加延迟
-  // (OpenAI SDK 默认重试 2 次,一次 429/5xx 就可能把耗时翻几倍直接撞上限)。
-  const client = new OpenAI({
-    apiKey: cfg.apiKey,
-    baseURL: cfg.baseURL,
-    timeout: Number(process.env.LLM_TIMEOUT_MS) || 50_000,
-    maxRetries: Number(process.env.LLM_MAX_RETRIES) || 0, // 非法/未设 → 0,不静默重试
-  });
+export async function generateGuardTurn(system: string, messages: Msg[]): Promise<GuardTurn> {
+  const cfg = requireConfig();
+  const client = buildClient(cfg);
   const sys = `${system}\n\n${JSON_INSTRUCTION}`;
-  const mode = (process.env.LLM_TOOL_MODE || "auto").toLowerCase();
+  const chain = chainFor(envMode());
 
-  // 模式 tool:只走工具,失败如实抛(诊断用)
-  if (mode === "tool") {
-    return parseTurn(await complete(client, cfg, sys, messages, { useTools: true }));
-  }
-
-  // 模式 auto:① 先试工具
-  if (mode === "auto" && !runtimeToolsDisabled) {
+  let lastErr: unknown;
+  for (const mode of chain) {
+    if (blocked[mode]) continue;
     try {
-      return parseTurn(await complete(client, cfg, sys, messages, { useTools: true }));
+      return await runOnce(mode, client, cfg, sys, messages);
     } catch (err) {
-      if (isToolUnsupported(err)) {
-        runtimeToolsDisabled = true;
-        console.warn("[llm] 模型不支持工具调用 → 降级 JSON 模式");
-      } else if (!(err instanceof NoJsonError)) {
-        throw err; // 网络/鉴权/限流等真错误,如实抛出
+      lastErr = err;
+      const decision = classify(err, mode);
+      if (decision === "throw") throw err;
+      if (decision === "stick") {
+        blocked[mode] = true;
+        console.warn(`[llm] ${mode} 模式端点拒收 → 永久降级`);
+      } else {
+        console.warn(`[llm] ${mode} 模式未返回可解析 JSON → 本次降级再试`);
       }
-      // NoJsonError(没调工具、正文也没 JSON)或工具不支持 → 落到 ② JSON 模式
     }
   }
-
-  // ② response_format=json_object → ③ 纯提示词
-  return jsonCompletion(client, cfg, sys, messages);
+  throw lastErr ?? new Error("LLM 所有降级路径都失败");
 }
 
-/** JSON 模式:先用 response_format 强约束;端点不支持就退回纯提示词 */
-async function jsonCompletion(
+function envMode(): "auto" | "tool" | "json" {
+  const m = (process.env.LLM_TOOL_MODE || "auto").toLowerCase();
+  return m === "tool" || m === "json" ? m : "auto";
+}
+
+function chainFor(mode: "auto" | "tool" | "json"): Mode[] {
+  if (mode === "tool") return ["tool"];
+  if (mode === "json") return ["json", "prompt"];
+  return ["tool", "json", "prompt"];
+}
+
+// ── 单次请求 ─────────────────────────────────────────────────────
+
+async function runOnce(
+  mode: Mode,
   client: OpenAI,
   cfg: ResolvedConfig,
   sys: string,
   messages: Msg[]
 ): Promise<GuardTurn> {
-  if (!runtimeJsonFormatUnsupported) {
-    try {
-      return parseTurn(
-        await complete(client, cfg, sys, messages, { jsonMode: true })
-      );
-    } catch (err) {
-      if (isResponseFormatUnsupported(err)) {
-        runtimeJsonFormatUnsupported = true;
-        console.warn("[llm] 端点不支持 response_format → 退回纯提示词");
-      } else {
-        throw err; // 含 NoJsonError:json_object 都没 JSON,属异常
-      }
-    }
-  }
-  // ③ 最后兜底:纯提示词 + 容错解析
-  return parseTurn(await complete(client, cfg, sys, messages, {}));
-}
-
-/** 发一次请求。useTools→带工具定义;jsonMode→带 response_format。都不带 = 纯文本。 */
-async function complete(
-  client: OpenAI,
-  cfg: ResolvedConfig,
-  sys: string,
-  messages: Msg[],
-  opts: { useTools?: boolean; jsonMode?: boolean } = {}
-) {
-  const body = {
+  const body: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
     model: cfg.model,
-    // 思考模型的推理 token 也算在内,太小容易只剩推理 → 默认 1024,可用 LLM_MAX_TOKENS 调高
+    // 思考模型的推理 token 也算在内,太小容易只剩推理空间 → 默认 1024
     max_tokens: Number(process.env.LLM_MAX_TOKENS) || 1024,
     messages: [{ role: "system", content: sys }, ...messages],
-    ...(opts.useTools ? { tools: TOOLS, tool_choice: "auto" as const } : {}),
-    ...(opts.jsonMode
-      ? { response_format: { type: "json_object" as const } }
-      : {}),
-    ...extraBody(), // 透传额外参数(如关思考),放最后以便按需覆盖
-  } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
+    ...(mode === "tool" ? { tools: TOOLS, tool_choice: "auto" as const } : {}),
+    ...(mode === "json" ? { response_format: { type: "json_object" as const } } : {}),
+    ...extraBody(), // 放最后:可按需覆盖前面字段
+  };
   const res = await client.chat.completions.create(body);
-  return res.choices[0]?.message;
+  return parseTurn(res.choices[0]?.message);
 }
 
-/** 先认工具调用的参数,没有就退回从正文抠 JSON */
-function parseTurn(
-  msg: Awaited<ReturnType<typeof complete>>
-): GuardTurn {
+function parseTurn(msg: OpenAI.Chat.Completions.ChatCompletionMessage | undefined): GuardTurn {
   const call = msg?.tool_calls?.[0];
-  if (call && call.type === "function") {
-    return normalizeGuardTurn(safeParse(call.function.arguments));
-  }
-  if (msg?.content) {
-    return normalizeGuardTurn(extractJson(msg.content));
-  }
-  // 没工具调用、也没正文 → 当作"拿不到结构化输出",交给上层降级
+  if (call?.type === "function") return normalize(parseLoose(call.function.arguments));
+  if (msg?.content) return normalize(extractJson(msg.content));
   throw new NoJsonError("模型没有返回可用的工具调用或文本内容");
 }
 
-/** 判断错误是否为"模型/服务商不支持工具或强制 tool_choice"的 400 */
-function isToolUnsupported(err: unknown): boolean {
-  const e = err as {
-    status?: number;
-    message?: string;
-    error?: { message?: string };
-  };
-  if (e?.status !== 400) return false;
-  const m = `${e?.message ?? ""} ${e?.error?.message ?? ""}`.toLowerCase();
-  return /tool|function|tool_choice|thinking|不支持/.test(m);
+// ── 客户端 / 配置 ────────────────────────────────────────────────
+
+function requireConfig(): ResolvedConfig {
+  const { apiKey, model, baseURL } = llmConfig();
+  if (!apiKey) throw new Error("缺少 LLM_API_KEY");
+  if (!model) throw new Error("缺少 LLM_MODEL(请指定模型名)");
+  return { apiKey, model, baseURL };
 }
 
-/** 判断错误是否为"端点不支持 response_format / json_object"的 400 */
-function isResponseFormatUnsupported(err: unknown): boolean {
-  const e = err as {
-    status?: number;
-    message?: string;
-    error?: { message?: string };
-  };
-  if (e?.status !== 400) return false;
-  const m = `${e?.message ?? ""} ${e?.error?.message ?? ""}`.toLowerCase();
-  return /response_format|response format|json_object|json mode|不支持/.test(m);
+function buildClient(cfg: ResolvedConfig): OpenAI {
+  // 超时略小于 Vercel maxDuration:慢端点优雅返 500("网络抽风"且不计回合),
+  // 不被平台硬超时成 504。maxRetries=0:429/5xx 重试会把耗时翻几倍撞函数上限。
+  return new OpenAI({
+    apiKey: cfg.apiKey,
+    baseURL: cfg.baseURL,
+    timeout: Number(process.env.LLM_TIMEOUT_MS) || 50_000,
+    maxRetries: Number(process.env.LLM_MAX_RETRIES) || 0,
+  });
 }
 
 /**
- * 透传给模型接口的额外 body 参数(JSON,来自 LLM_EXTRA_BODY)。
- * 最大用途:关掉思考模型的推理,大幅降延迟,以便单轮在 Vercel Hobby 的 60s 内跑完。
- * 不同网关参数名不同,常见几种(任选其一):
- *   GLM/智谱:  {"thinking":{"type":"disabled"}}
- *   vLLM/中转:  {"chat_template_kwargs":{"enable_thinking":false}}
- *   通用推理档: {"reasoning_effort":"low"}
+ * LLM_EXTRA_BODY:透传到接口的额外字段。最大用途:关思考模型推理,大幅降延迟。
+ * 不同网关参数名不同,任选其一:
+ *   GLM/智谱:    {"thinking":{"type":"disabled"}}
+ *   vLLM/中转:   {"chat_template_kwargs":{"enable_thinking":false}}
+ *   通用推理档:  {"reasoning_effort":"low"}
  */
 function extraBody(): Record<string, unknown> {
   const raw = process.env.LLM_EXTRA_BODY;
@@ -238,7 +209,9 @@ function extraBody(): Record<string, unknown> {
   }
 }
 
-function safeParse(s: string): unknown {
+// ── 文本解析 ─────────────────────────────────────────────────────
+
+function parseLoose(s: string): unknown {
   try {
     return JSON.parse(s);
   } catch {
@@ -246,41 +219,32 @@ function safeParse(s: string): unknown {
   }
 }
 
-/** 容错地从模型文本中提取 JSON:去掉 <think> 推理块与 ```json 围栏,取第一个 {...} */
+/** 去 <think> 与 ```json 围栏,取最外层 {...}。失败抛 NoJsonError(让上层降级,不要 500)。 */
 function extractJson(text: string): unknown {
   let s = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) s = fence[1];
   const start = s.indexOf("{");
   const end = s.lastIndexOf("}");
-  if (start === -1 || end <= start) {
-    throw new NoJsonError();
-  }
+  if (start === -1 || end <= start) throw new NoJsonError();
   try {
     return JSON.parse(s.slice(start, end + 1));
   } catch {
-    // 截断/畸形 JSON 也当作"拿不到结构化输出",交给上层降级(而非裸 SyntaxError → 500)
     throw new NoJsonError("JSON 解析失败(可能被 max_tokens 截断)");
   }
 }
 
-/** 把可能脏的对象规整成合法的 GuardTurn(防止字符串数字、缺字段等) */
-function normalizeGuardTurn(o: unknown): GuardTurn {
+function normalize(o: unknown): GuardTurn {
   const obj = (o ?? {}) as Record<string, unknown>;
-  const emotions: Emotion[] = ["wary", "amused", "annoyed", "won_over"];
-
-  let delta = Number(obj.persuasion_delta);
-  if (!Number.isFinite(delta)) delta = 0;
-  delta = Math.max(-20, Math.min(20, Math.round(delta)));
-
-  const emotion = emotions.includes(obj.emotion as Emotion)
-    ? (obj.emotion as Emotion)
-    : "wary";
-
+  const raw = obj.persuasion_delta;
+  // 显式区分"模型漏填/填错"和"模型给了 0":前者前端会渲染 ?,后者渲染 ±0
+  const missing = raw === undefined || raw === null || !Number.isFinite(Number(raw));
+  const delta = missing ? 0 : Math.max(-20, Math.min(20, Math.round(Number(raw))));
   return {
     reply: String(obj.reply ?? "").trim() || "……",
-    emotion,
+    emotion: EMOTIONS.includes(obj.emotion as Emotion) ? (obj.emotion as Emotion) : "wary",
     persuasion_delta: delta,
+    delta_missing: missing,
     redline_hit: obj.redline_hit === true || obj.redline_hit === "true",
   };
 }

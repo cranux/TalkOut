@@ -32,17 +32,33 @@ export interface Character {
 export interface GuardTurn {
   reply: string;
   emotion: Emotion;
-  /** 本轮说服度变化,-20..+20 */
+  /** 本轮说服度变化,-20..+20。模型漏填或填错时为 0,且 delta_missing=true */
   persuasion_delta: number;
+  /** 模型没给合法数字 → 后端兜底成 0,但前端用这个标记显示"?"而不是 ±0 */
+  delta_missing?: boolean;
   /** 是否踩红线 → 直接翻车 */
   redline_hit: boolean;
+}
+
+/** 历史里 assistant 行的结构化元数据(本次会话产出的,opener 没有) */
+export interface TurnMeta {
+  emotion: Emotion;
+  persuasion_delta: number;
+  redline_hit: boolean;
+}
+
+/** 历史对话的一条消息 */
+export interface TalkHistoryItem {
+  role: "user" | "assistant";
+  content: string;
+  /** 仅 assistant 行才有。回灌给模型当"我上一轮长这样"的范本,防多轮里漏字段。 */
+  meta?: TurnMeta;
 }
 
 /** 前端发给后端的请求体 */
 export interface TalkRequest {
   characterId: string;
-  /** 历史对话,user = 玩家,assistant = AI 角色台词 */
-  history: { role: "user" | "assistant"; content: string }[];
+  history: TalkHistoryItem[];
 }
 
 export type Outcome = "ongoing" | "won" | "lost_rounds" | "lost_redline";
